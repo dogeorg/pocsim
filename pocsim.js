@@ -54,9 +54,8 @@ function init() {
 			fail_ends: 0,
 		})
 	}
-	for (let i=0; i<num_nodes; i++) {
-		// choose random peers to connect to
-		const node = nodes[i];
+	for (let node of nodes) {
+		// ensure every peer has some inbound connections
 		const peers = [];
 		let n = peer_conns
 		while (n) {
@@ -65,6 +64,14 @@ function init() {
 			peers.push(id)
 			nodes[id].peers.push(node.addr) // gossip to me
 			n--;
+		}
+	}
+	for (let node of nodes) {
+		// ensure every peer has some outbound connections
+		while (node.peers.length < peer_conns) {
+			let id = Math.floor(Math.random()*num_nodes)
+			if (node.peers.includes(id)) continue
+			node.peers.push(id)
 		}
 	}
 	// populate the ring with a random permutation of 1/4 of the nodes.
