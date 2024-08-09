@@ -139,10 +139,10 @@ function think(node) {
 		const ideal_height = Math.floor(time / block_interval)
 		if (node.height < ideal_height) {
 			node.due_time = time + short_interval
-			console.log(`${time}: [${node.addr}] I expect ${ring[node.turn]} to produce a block (ideally ${1+ideal_height}) - quickly!`);
+			console.log(`${time}: [${node.addr}] it's ${ring[node.turn]}'s turn to produce a block (ideal ${1+ideal_height}) - quickly!`);
 		} else {
 			node.due_time = time + block_interval
-			console.log(`${time}: [${node.addr}] I expect ${ring[node.turn]} to produce a block (ideally ${1+ideal_height})`);
+			console.log(`${time}: [${node.addr}] it's ${ring[node.turn]}'s turn to produce a block (ideal ${1+ideal_height})`);
 		}
 	}
 
