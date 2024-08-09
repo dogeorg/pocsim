@@ -3,9 +3,10 @@
 const num_nodes = 100;
 const sim_time = 10000;
 const peer_conns = 4; // 1 + Log10(size-of-network) ?
-const fail_chance = 0.01 // chance of failure; 0 = no failure
+const fail_chance = 0.1 // chance of failure; 0 = no failure
 const fail_max_time = 80 // up to 8 seconds
 const block_interval = 60 // 6 seconds (10 ticks per second)
+const short_interval = 50 // 5 seconds (10 ticks per second)
 const attest_interval = 20 // 2 second attestation period
 const catchup_timeout = 30 // 3 seconds to get a catchup-block
 
@@ -17,13 +18,10 @@ let ring = []
 let nodes = []
 
 // Index of the next staking node to propose a block, in the ring
-let turn = 3 // prior 3 nodes will attest 1st block
+// let turn = 3 // prior 3 nodes will attest 1st block
 
 // The current simulation time (one tick = 100ms)
 let time = 0
-
-// Number of block-intervals that have passed
-let num_intervals = 1
 
 // Unique block hash so nodes can compare tip
 let nexthash = 286127
@@ -52,6 +50,9 @@ function init() {
 			attested: 0,
 			staking: false,
 			fail_ends: 0,
+			due_time: 0,
+			turn: 3,
+			blocks: [],
 		})
 	}
 	for (let node of nodes) {
@@ -75,7 +76,7 @@ function init() {
 		}
 	}
 	// populate the ring with a random permutation of 1/4 of the nodes.
-	let n = Math.floor(nodes.length/4);
+	let n = Math.max(100, Math.floor(nodes.length/4));
 	while (n) {
 		let id = Math.floor(Math.random()*nodes.length)
 		if (ring.includes(id)) continue
@@ -111,31 +112,62 @@ function failure() {
 	}
 }
 
-function prev(n) {
-	n = turn - n;
-	if (n < 0) n += ring.length;
-	return ring[n]
+function prev(turn,n) {
+	const p = ring[(turn + ring.length - n) % ring.length];
+	if (p == null) throw `${turn} ${turn + ring.length - n} ${ring.length}`;
+	return p;
 }
 
-function think(node, proposer) {
+function think(node) {
 	if (!node.online) return;
 
-	if (node === proposer) {
+	// if a block was missed (clock > node.height)
+	// subsequent block times are shortened to catch up
+	// const since = Math.max(0, time - (node.height * block_interval));
+	// const clock = node.height + Math.floor(since / short_interval);
+	// const turn = ring[clock % ring.length];
+	// can go back in time:
+	// when adding node.height, the now-past short-blocks become long-blocks
+	// meaning the more recent short-blocks can become undone!
+
+	// do we record the time-slice assigned to each block?
+	// due_time += block_interval or short_interval
+
+	if (time >= node.due_time) {
+		// time for the next turn to start.
+		node.turn = (node.turn + 1) % ring.length;
+		const ideal_height = Math.floor(time / block_interval)
+		if (node.height < ideal_height) {
+			node.due_time = time + short_interval
+			console.log(`${time}: [${node.addr}] I expect ${ring[node.turn]} to produce a block (ideally ${1+ideal_height}) - quickly!`);
+		} else {
+			node.due_time = time + block_interval
+			console.log(`${time}: [${node.addr}] I expect ${ring[node.turn]} to produce a block (ideally ${1+ideal_height})`);
+		}
+	}
+
+	if (node.addr == ring[node.turn]) {
 		// my turn to mint a block
 		if (!node.block) {
-			let block = { block:"block", sig:node.addr, hash:nexthash++, height:node.height+1, time:time, attest:[] };
+			let block = { block:"block", sig:node.addr, hash:nexthash++, prev:node.tip, height:node.height+1, time:time, attest:[] };
 			node.block = block;
 			node.started = time;
 			node.proposed++;
 			console.log(`${time}: [${node.addr}] I propose a block at height ${block.height}`);
-			// send request to 3 prior nodes to attest the block
-			send(prev(1), node.addr, 'attest', block);
-			send(prev(2), node.addr, 'attest', block);
-			send(prev(3), node.addr, 'attest', block);
+			// send request to 5 prior nodes to attest the block
+			send(prev(node.turn,7), node.addr, 'attest', block);
+			send(prev(node.turn,21), node.addr, 'attest', block);
+			send(prev(node.turn,35), node.addr, 'attest', block);
+			send(prev(node.turn,56), node.addr, 'attest', block);
+			send(prev(node.turn,77), node.addr, 'attest', block);
 		}
 	} else {
-		node.block = null;
-		node.started = 0;
+		// not my turn.
+		if (node.block) {
+			console.log(`${time}: [${node.addr}] My turn is finished`);
+			node.block = null;
+			node.started = 0;
+		}
 	}
 }
 
@@ -147,6 +179,19 @@ function ask_a_peer(node) {
 	} else {
 		console.log(`${time}: [${node.addr}] Fie! I don't have any peers.`);
 	}
+}
+
+function check_behind(node, height) {
+	if (height > node.height) {
+		// I need to catch up, but can't really trust the sender.
+		// But first, am I already catching up?
+		if (time >= node.catchup) {
+			// OK to start catching up.
+			// I'll ask a peer to send me the next block, and see if that works.
+			console.log(`${time}: [${node.addr}] I am behind; asking a peer for help.`);
+			ask_a_peer(node);
+		}
+	}	
 }
 
 function receive(node, name, data, from) {
@@ -161,7 +206,7 @@ function receive(node, name, data, from) {
 		case 'attest': {
 			// another node has requested attestation
 			const block = data;
-			if (!block.sig == ring[turn]) {
+			if (!block.sig == ring[node.turn]) {
 				console.log(`${time}: [${node.addr}] I refuse to attest: it's not your turn, ${block.sig}!`);
 				return;
 			}
@@ -171,6 +216,12 @@ function receive(node, name, data, from) {
 			}
 			if (block.height !== node.height+1) {
 				console.log(`${time}: [${node.addr}] I refuse to attest: your block has the wrong height: ${block.height} (expecting ${node.height+1})`);
+				check_behind(node, block.height);
+				return;
+			}
+			if (block.prev !== node.tip) {
+				console.log(`${time}: [${node.addr}] I refuse to attest: your block has the wrong prev-hash: ${block.prev} (expecting ${node.tip})`);
+				check_behind(node, block.height);
 				return;
 			}
 			node.attested++;
@@ -180,20 +231,28 @@ function receive(node, name, data, from) {
 		case 'attested': {
 			// another node has attested to my block
 			const block = node.block;
-			if (block != null) {
-				// I am minting a block.
-				block.attest.push(data.sig);
+			if (block != null && block.attest.length < 3) {
+				// I am minting a block and I still need attestations.
+				if (!block.attest.includes(data.sig)) {
+					block.attest.push(data.sig);
+				}
 				console.log(`${time}: [${node.addr}] I received your attestation, [${from}]; have=${block.attest.length} start=${node.started} time=${time}`);
 				// Do I have 3 attestations, within the attestation period?
 				if (block.attest.length == 3 && time < node.started + attest_interval) {
 					// Success! Gossip the new block.
-					console.log(`${time}: [${node.addr}] I minted a block at height ${block.height}!`);
 					// But first, I should accept my own block.
-					node.height = block.height
-					node.tip = block.hash
-					gossip(node.peers, node.addr, 'block', block);
+					if (block.prev === node.tip) {
+						node.height = block.height
+						node.tip = block.hash
+						node.blocks.push(block);
+						console.log(`${time}: [${node.addr}] I minted a block at height ${block.height}!`);
+						gossip(node.peers, node.addr, 'block', block);
+					} else {
+						console.log(`${time}: [${node.addr}] Oops! My minted block is no longer at the tip: ${block.prev} vs ${node.tip}`);
+					}
 				}
-
+			} else if (block != null) {
+				console.log(`${time}: [${node.addr}] I don't need your attestation, [${from}]; have=${block.attest.length} start=${node.started} time=${time}`);
 			}
 			return;
 		}
@@ -201,19 +260,12 @@ function receive(node, name, data, from) {
 			// if the block has 3 attestations and matches my height, accept the block.
 			const block = data;
 			if (block.hash != node.tip) {
-				// simulation: assume I verify signature, attestations, prev_hash, transactions vs chainstate, etc.
+				// simulation: assume I verify signature, attestations, transactions vs chainstate, etc.
 				if (block.height !== node.height + 1) {
 					console.log(`${time}: [${node.addr}] I reject your block: wrong height: ${block.height} (expecting ${node.height+1})`);
-					if (block.height > node.height) {
-						// I need to catch up, but can't really trust the sender.
-						// But first, am I already catching up?
-						if (time >= node.catchup) {
-							// OK to start catching up.
-							// I'll ask a peer to send me the next block, and see if that works.
-							console.log(`${time}: [${node.addr}] I am behind; asking a peer for help.`);
-							ask_a_peer(node);
-						}
-					}
+					check_behind(node, block.height);
+				} else if (block.prev !== node.tip) {
+					console.log(`${time}: [${node.addr}] I reject your block: wrong prev-hash: ${block.prev} (expecting ${node.tip})`);
 				} else if (block.attest.length !== 3) {
 					console.log(`${time}: [${node.addr}] I reject your block: not enough attestations`);
 				} else if (block.time > time) {
@@ -222,6 +274,7 @@ function receive(node, name, data, from) {
 					node.height = block.height
 					node.tip = block.hash;
 					node.accepted++;
+					node.blocks.push(block);
 					console.log(`${time}: [${node.addr}] I accepted a block at height ${block.height}`);
 					if (time < node.catchup) {
 						// I'm catching up on missed blocks.
@@ -239,11 +292,8 @@ function receive(node, name, data, from) {
 		case 'getblock': {
 			// send back a block if I have it.
 			const request = data;
-			if (request.height <= node.height) {
-				// simulation: reconstitute the block on the fly.
-				let when = time - block_interval * (node.height - request.height);
-				let block = { block:"block", sig:node.addr, hash:nexthash++, height:request.height, time:when, attest:[1,2,3] };
-				send(from, node.addr, 'block', block);
+			if (request.height > 0 && request.height <= node.blocks.length) {
+				send(from, node.addr, 'block', node.blocks[request.height-1]);
 			} else {
 				console.log(`${time}: [${node.addr}] I don't have block ${request.height}`);
 			}
@@ -269,13 +319,6 @@ function gossip(peers,from,name,data) {
 function tick() {
 	time++;
 
-	let step = time % block_interval;
-	if (step == 0) {
-		turn = (turn+1) % ring.length; // next node's turn
-		num_intervals++;
-		console.log(`${time}: Start of ${ring[turn]}'s turn, at block-interval ${num_intervals}`);
-	}
-
 	failure(); // random node failure.
 
 	// make queued messages arrive.
@@ -292,14 +335,12 @@ function tick() {
 	queue.length = to;
 
 	// let each node think
-	let proposer = nodes[ring[turn]];
 	for (let node of nodes) {
-		think(node, proposer);
+		think(node);
 	}
 }
 
 function run() {
-	console.log(`${time}: Start of ${ring[turn]}'s turn, at block-interval ${num_intervals}`);
 	for (let i=0; i<sim_time; i++) {
 		tick();
 	}
